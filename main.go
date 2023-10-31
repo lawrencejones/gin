@@ -4,12 +4,11 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/codegangsta/envy/lib"
-	"github.com/codegangsta/gin/lib"
+	envy "github.com/codegangsta/envy/lib"
+	gin "github.com/codegangsta/gin/lib"
 	shellwords "github.com/mattn/go-shellwords"
 	"gopkg.in/urfave/cli.v1"
 
-	"github.com/0xAX/notificator"
 	"log"
 	"os"
 	"os/signal"
@@ -18,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/0xAX/notificator"
 )
 
 var (
@@ -73,6 +74,12 @@ func main() {
 			Value:  "",
 			EnvVar: "GIN_BUILD",
 			Usage:  "Path to build files from (defaults to same value as --path)",
+		},
+		cli.StringFlag{
+			Name:   "buildEventEndpoint",
+			Value:  "",
+			EnvVar: "GIN_BUILD_EVENT_ENDPOINT",
+			Usage:  "Endpoint to send build analytics to",
 		},
 		cli.StringSliceFlag{
 			Name:   "excludeDir,x",
@@ -146,6 +153,7 @@ func MainAction(c *cli.Context) {
 	all := c.GlobalBool("all")
 	appPort := strconv.Itoa(c.GlobalInt("appPort"))
 	immediate = c.GlobalBool("immediate")
+	buildEventEndpoint := c.GlobalString("buildEventEndpoint")
 	keyFile := c.GlobalString("keyFile")
 	certFile := c.GlobalString("certFile")
 	logPrefix := c.GlobalString("logPrefix")
@@ -173,7 +181,7 @@ func MainAction(c *cli.Context) {
 	if buildPath == "" {
 		buildPath = c.GlobalString("path")
 	}
-	builder := gin.NewBuilder(buildPath, c.GlobalString("bin"), c.GlobalBool("godep"), wd, buildArgs)
+	builder := gin.NewBuilder(buildPath, c.GlobalString("bin"), c.GlobalBool("godep"), wd, buildArgs, buildEventEndpoint)
 	runner := gin.NewRunner(filepath.Join(wd, builder.Binary()), c.Args()...)
 	runner.SetWriter(os.Stdout)
 	proxy := gin.NewProxy(builder, runner)
