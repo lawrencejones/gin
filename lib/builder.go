@@ -31,6 +31,8 @@ type BuildEvent struct {
 	ProcessorCount  string    `json:"processor_count,omitempty"`
 	MemoryTotal     string    `json:"memory_total,omitempty"`
 	MemoryFree      string    `json:"memory_free,omitempty"`
+	PowerSource     string    `json:"power_source,omitempty"`
+	BatteryLevel    string    `json:"battery_level,omitempty"`
 	User            string    `json:"user"`
 	ExitStatus      int       `json:"exit_status"`
 	DurationSeconds float64   `json:"duration_seconds"`
@@ -130,8 +132,9 @@ func (b *builder) Build() error {
 	}
 
 	var (
-		processorsRegex = regexp.MustCompile(`^(\d+) processors are physically available.`)
-		memoryFreeRegex = regexp.MustCompile(`^System-wide memory free percentage:\s+(\d+)%`)
+		processorsRegex   = regexp.MustCompile(`^(\d+) processors are physically available.`)
+		memoryFreeRegex   = regexp.MustCompile(`^System-wide memory free percentage:\s+(\d+)%`)
+		batteryLevelRegex = regexp.MustCompile(`^ -InternalBattery-0.+?(\d+)%`)
 	)
 
 	hostinfo, _ := exec.Command("hostinfo").Output()
@@ -147,6 +150,20 @@ func (b *builder) Build() error {
 	for _, line := range strings.Split(string(memoryPressure), "\n") {
 		if memoryFreeRegex.MatchString(line) {
 			ev.MemoryFree = memoryFreeRegex.FindStringSubmatch(line)[1]
+		}
+	}
+
+	pmset, _ := exec.Command("pmset", "-g", "batt").Output()
+	for _, line := range strings.Split(string(pmset), "\n") {
+		ev.PowerSource = "UNKNOWN"
+		if strings.HasPrefix(line, "Now drawing from 'AC Power'") {
+			ev.PowerSource = "AC"
+		} else if strings.HasPrefix(line, "Now drawing from 'Battery Power'") {
+			ev.PowerSource = "BATTERY"
+		}
+
+		if batteryLevelRegex.MatchString(line) {
+			ev.BatteryLevel = batteryLevelRegex.FindStringSubmatch(line)[1]
 		}
 	}
 
