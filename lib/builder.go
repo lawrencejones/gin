@@ -1,11 +1,20 @@
 package gin
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 type Builder interface {
@@ -14,16 +23,34 @@ type Builder interface {
 	Errors() string
 }
 
-type builder struct {
-	dir       string
-	binary    string
-	errors    string
-	useGodep  bool
-	wd        string
-	buildArgs []string
+type BuildEvent struct {
+	ID              string    `json:"id"`
+	Timestamp       time.Time `json:"timestamp"`
+	Args            []string  `json:"args"`
+	Platform        string    `json:"platform"`
+	ProcessorCount  string    `json:"processor_count,omitempty"`
+	MemoryTotal     string    `json:"memory_total,omitempty"`
+	MemoryFree      string    `json:"memory_free,omitempty"`
+	PowerSource     string    `json:"power_source,omitempty"`
+	BatteryLevel    string    `json:"battery_level,omitempty"`
+	User            string    `json:"user"`
+	ExitStatus      int       `json:"exit_status"`
+	DurationSeconds float64   `json:"duration_seconds"`
 }
 
-func NewBuilder(dir string, bin string, useGodep bool, wd string, buildArgs []string) Builder {
+type builder struct {
+	dir                string
+	binary             string
+	logFile            *os.File
+	buildEventEndpoint string
+	platform           string
+	errors             string
+	useGodep           bool
+	wd                 string
+	buildArgs          []string
+}
+
+func NewBuilder(dir string, bin string, useGodep bool, wd string, buildArgs []string, buildEventEndpoint string) Builder {
 	if len(bin) == 0 {
 		bin = "bin"
 	}
@@ -35,7 +62,31 @@ func NewBuilder(dir string, bin string, useGodep bool, wd string, buildArgs []st
 		}
 	}
 
-	return &builder{dir: dir, binary: bin, useGodep: useGodep, wd: wd, buildArgs: buildArgs}
+	logFilePath := os.Getenv("GIN_BUILD_LOG")
+	if logFilePath == "" {
+		logFilePath = path.Join(os.Getenv("HOME"), ".gin-build.log")
+	}
+
+	logFile, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(fmt.Errorf("failed to open log file: %w", err))
+	}
+
+	platformBytes, err := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output()
+	if err != nil {
+		platformBytes = []byte("unknown")
+	}
+
+	return &builder{
+		dir:                dir,
+		binary:             bin,
+		logFile:            logFile,
+		buildEventEndpoint: buildEventEndpoint,
+		platform:           string(platformBytes),
+		useGodep:           useGodep,
+		wd:                 wd,
+		buildArgs:          buildArgs,
+	}
 }
 
 func (b *builder) Binary() string {
@@ -57,12 +108,94 @@ func (b *builder) Build() error {
 
 	command.Dir = b.dir
 
+	startAt := time.Now()
 	output, err := command.CombinedOutput()
-
+	var (
+		duration   = time.Since(startAt)
+		exitStatus = 0
+	)
 	if command.ProcessState.Success() {
 		b.errors = ""
 	} else {
 		b.errors = string(output)
+		exitStatus = command.ProcessState.ExitCode()
+	}
+
+	ev := BuildEvent{
+		ID:              uuid.NewString(),
+		Timestamp:       time.Now(),
+		Args:            args,
+		Platform:        b.platform,
+		User:            os.Getenv("USER"),
+		ExitStatus:      exitStatus,
+		DurationSeconds: duration.Seconds(),
+	}
+
+	var (
+		processorsRegex   = regexp.MustCompile(`^(\d+) processors are physically available.`)
+		memoryFreeRegex   = regexp.MustCompile(`^System-wide memory free percentage:\s+(\d+)%`)
+		batteryLevelRegex = regexp.MustCompile(`^ -InternalBattery-0.+?(\d+)%`)
+	)
+
+	hostinfo, _ := exec.Command("hostinfo").Output()
+	for _, line := range strings.Split(string(hostinfo), "\n") {
+		if processorsRegex.MatchString(line) {
+			ev.ProcessorCount = processorsRegex.FindStringSubmatch(line)[1]
+		} else if strings.HasPrefix(line, "Primary memory available: ") {
+			ev.MemoryTotal = strings.SplitN(line, ": ", 2)[1]
+		}
+	}
+
+	memoryPressure, _ := exec.Command("memory_pressure").Output()
+	for _, line := range strings.Split(string(memoryPressure), "\n") {
+		if memoryFreeRegex.MatchString(line) {
+			ev.MemoryFree = memoryFreeRegex.FindStringSubmatch(line)[1]
+		}
+	}
+
+	pmset, _ := exec.Command("pmset", "-g", "batt").Output()
+	for _, line := range strings.Split(string(pmset), "\n") {
+		ev.PowerSource = "UNKNOWN"
+		if strings.HasPrefix(line, "Now drawing from 'AC Power'") {
+			ev.PowerSource = "AC"
+		} else if strings.HasPrefix(line, "Now drawing from 'Battery Power'") {
+			ev.PowerSource = "BATTERY"
+		}
+
+		if batteryLevelRegex.MatchString(line) {
+			ev.BatteryLevel = batteryLevelRegex.FindStringSubmatch(line)[1]
+		}
+	}
+
+	{
+		err = json.NewEncoder(b.logFile).Encode(ev)
+		if err != nil {
+			fmt.Println(fmt.Errorf("failed to log event: %w", err))
+		} else {
+			b.logFile.Sync()
+
+			go func() {
+				data, err := json.Marshal(map[string]any{"payload": ev})
+				if err != nil {
+					fmt.Println(fmt.Errorf("failed to marshal event: %w", err))
+				}
+
+				req, err := http.NewRequest("POST", b.buildEventEndpoint, bytes.NewReader(data))
+				if err != nil {
+					fmt.Println(fmt.Errorf("failed to log event: %w", err))
+					return
+				}
+
+				req.Header.Set("Content-Type", "application/json")
+
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					fmt.Println(fmt.Errorf("failed to send build event: %w", err))
+				} else {
+					fmt.Printf("build event sent: %v\n", resp.Status)
+				}
+			}()
+		}
 	}
 
 	if len(b.errors) > 0 {
