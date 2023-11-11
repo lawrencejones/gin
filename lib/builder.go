@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -27,6 +28,9 @@ type BuildEvent struct {
 	Timestamp       time.Time `json:"timestamp"`
 	Args            []string  `json:"args"`
 	Platform        string    `json:"platform"`
+	ProcessorCount  string    `json:"processor_count,omitempty"`
+	MemoryTotal     string    `json:"memory_total,omitempty"`
+	MemoryFree      string    `json:"memory_free,omitempty"`
 	User            string    `json:"user"`
 	ExitStatus      int       `json:"exit_status"`
 	DurationSeconds float64   `json:"duration_seconds"`
@@ -123,6 +127,27 @@ func (b *builder) Build() error {
 		User:            os.Getenv("USER"),
 		ExitStatus:      exitStatus,
 		DurationSeconds: duration.Seconds(),
+	}
+
+	var (
+		processorsRegex = regexp.MustCompile(`^(\d+) processors are physically available.`)
+		memoryFreeRegex = regexp.MustCompile(`^System-wide memory free percentage:\s+(\d+)%`)
+	)
+
+	hostinfo, _ := exec.Command("hostinfo").Output()
+	for _, line := range strings.Split(string(hostinfo), "\n") {
+		if processorsRegex.MatchString(line) {
+			ev.ProcessorCount = processorsRegex.FindStringSubmatch(line)[1]
+		} else if strings.HasPrefix(line, "Primary memory available: ") {
+			ev.MemoryTotal = strings.SplitN(line, ": ", 2)[1]
+		}
+	}
+
+	memoryPressure, _ := exec.Command("memory_pressure").Output()
+	for _, line := range strings.Split(string(memoryPressure), "\n") {
+		if memoryFreeRegex.MatchString(line) {
+			ev.MemoryFree = memoryFreeRegex.FindStringSubmatch(line)[1]
+		}
 	}
 
 	{
